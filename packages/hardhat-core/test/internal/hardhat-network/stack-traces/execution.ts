@@ -1,3 +1,5 @@
+import { Block } from "@nomicfoundation/ethereumjs-block";
+import { Common } from "@nomicfoundation/ethereumjs-common";
 import { Transaction, TxData } from "@nomicfoundation/ethereumjs-tx";
 import {
   Account,
@@ -5,14 +7,14 @@ import {
   privateToAddress,
   bigIntToBuffer,
 } from "@nomicfoundation/ethereumjs-util";
-import { VM } from "@nomicfoundation/ethereumjs-vm";
 import abi from "ethereumjs-abi";
-import { Rethnet } from "rethnet-evm";
+import { HardhatBlockchain } from "../../../../src/internal/hardhat-network/provider/HardhatBlockchain";
 
-import { assertEthereumJsAndRethnetResults } from "../../../../src/internal/hardhat-network/provider/utils/assertions";
-import { ethereumjsTransactionToRethnet } from "../../../../src/internal/hardhat-network/provider/utils/convertToRethnet";
+// FVTODO use VmAdapter
+import { EthereumJSAdapter } from "../../../../src/internal/hardhat-network/provider/vm/ethereumjs";
 import { MessageTrace } from "../../../../src/internal/hardhat-network/stack-traces/message-trace";
 import { VMTracer } from "../../../../src/internal/hardhat-network/stack-traces/vm-tracer";
+import { defaultHardhatNetworkParams } from "../../../../src/internal/core/config/default-config";
 
 const senderPrivateKey = Buffer.from(
   "e331b6d69882b4cb4ea581d88e0b604039a3de5967688d3dcffdd2270c0fd109",
@@ -20,14 +22,43 @@ const senderPrivateKey = Buffer.from(
 );
 const senderAddress = privateToAddress(senderPrivateKey);
 
-export async function instantiateVm(): Promise<VM> {
+export async function instantiateVm(): Promise<EthereumJSAdapter> {
   const account = Account.fromAccountData({ balance: 1e15 });
 
-  const vm = await VM.create({ activatePrecompiles: true });
+  const common = new Common({ chain: "mainnet" });
+  const blockchain = new HardhatBlockchain(common);
+  await blockchain.addBlock(
+    Block.fromBlockData({
+      header: {
+        number: 0n,
+      },
+    })
+  );
 
-  await vm.stateManager.putAccount(new Address(senderAddress), account);
+  const vm = await EthereumJSAdapter.create(
+    common,
+    blockchain,
+    true,
+    new Map(),
+    {
+      automine: true,
+      blockGasLimit: 1_000_000,
+      chainId: 1,
+      genesisAccounts: [],
+      hardfork: "london",
+      minGasPrice: 0n,
+      networkId: 1,
+      networkName: "mainnet",
+      mempoolOrder: "priority",
+      coinbase: "0x0000000000000000000000000000000000000000",
+      chains: defaultHardhatNetworkParams.chains,
+    }
+  );
 
-  return vm;
+  await vm.putAccount(new Address(senderAddress), account);
+
+  // FVTODO remove as any
+  return vm as any;
 }
 
 export function encodeConstructorParams(
@@ -61,8 +92,7 @@ export function encodeCall(
 }
 
 export async function traceTransaction(
-  vm: VM,
-  rethnet: Rethnet,
+  vm: EthereumJSAdapter,
   txData: TxData
 ): Promise<MessageTrace> {
   const tx = new Transaction({
@@ -76,23 +106,36 @@ export async function traceTransaction(
 
   const signedTx = tx.sign(senderPrivateKey);
 
-  const getContractCode = vm.stateManager.getContractCode.bind(vm.stateManager);
-
-  const vmTracer = new VMTracer(vm, getContractCode);
+  const vmTracer = new VMTracer(vm as any);
   vmTracer.enableTracing();
 
   try {
-    const rethnetTx = ethereumjsTransactionToRethnet(signedTx);
+    // FVTODO dualmode
+    // const rethnetTx = ethereumjsTransactionToRethnet(signedTx);
 
-    const rethnetResult = await rethnet.dryRun(rethnetTx, {
-      number: 0n,
-      coinbase: Buffer.from("0000000000000000000000000000000000000000", "hex"),
-      timestamp: BigInt(Math.floor(Date.now() / 1000)),
-      gasLimit: 4000000n,
-    });
+    // const rethnetResult = await rethnet.dryRun(rethnetTx, {
+    //   number: 0n,
+    //   coinbase: Buffer.from("0000000000000000000000000000000000000000", "hex"),
+    //   timestamp: BigInt(Math.floor(Date.now() / 1000)),
+    //   gasLimit: 4000000n,
+    // });
 
-    const txResult = await vm.runTx({ tx: signedTx });
-    assertEthereumJsAndRethnetResults(rethnetResult.execResult, txResult);
+    // FVTODO all of this won't work for a non EthereumJSAdapter, I need
+    // to figure out an alternative
+    const latestBlockNumber = await (
+      vm as any
+    )._vm.blockchain.getLatestBlockNumber();
+
+    // eslint-disable-next-line @typescript-eslint/dot-notation
+    const blockContext = await vm["_vm"].blockchain.getBlock(latestBlockNumber);
+
+    if (blockContext === null) {
+      throw new Error("shouldn't happen");
+    }
+
+    const blockBuilder = await vm.buildBlock(blockContext, {});
+    await blockBuilder.addTransaction(signedTx);
+    await blockBuilder.build();
 
     const messageTrace = vmTracer.getLastTopLevelMessageTrace();
     if (messageTrace === undefined) {
@@ -105,7 +148,7 @@ export async function traceTransaction(
   }
 }
 
-async function getNextPendingNonce(vm: VM): Promise<Buffer> {
-  const acc = await vm.stateManager.getAccount(new Address(senderAddress));
+async function getNextPendingNonce(vm: EthereumJSAdapter): Promise<Buffer> {
+  const acc = await vm.getAccount(new Address(senderAddress));
   return bigIntToBuffer(acc.nonce);
 }
